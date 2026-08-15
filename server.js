@@ -1,10 +1,15 @@
-
 import express from "express";
 import cors from "cors";
-import { getAIResponse, providerStatus } from "./lib/providers.js";
+import multer from "multer";
+import { getAIResponse, providerStatus, transcribeAudio } from "./lib/providers.js";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB — plenty for a spoken answer
+});
 
 app.use(express.json({ limit: "2mb" }));
 
@@ -78,50 +83,123 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────
+// POST /transcribe
+// multipart/form-data, field name: "audio"
+// Response: { text, duration, language }
+// ─────────────────────────────────────────────────────────
+app.post("/transcribe", upload.single("audio"), async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file || !file.buffer || file.buffer.length === 0) {
+      return res.status(400).json({ error: "No audio received. Please try recording again." });
+    }
+    // A few hundred bytes of webm/ogg container with no real speech —
+    // reject before spending a transcription call on it.
+    if (file.buffer.length < 800) {
+      return res.status(400).json({ error: "Recording was too short. Please try again." });
+    }
+
+    const result = await transcribeAudio(file.buffer, file.originalname, file.mimetype);
+
+    if (!result) {
+      return res.status(503).json({ error: "Couldn't understand that recording. Please try again." });
+    }
+    if (!result.text) {
+      return res.status(400).json({ error: "Couldn't understand that recording. Please try again." });
+    }
+
+    return res.json(result);
+  } catch (err) {
+    console.error("TRANSCRIBE ERROR:", err);
+    return res.status(500).json({ error: "Couldn't understand that recording. Please try again." });
+  }
+});
+
+// ─────────────────────────────────────────────────────────
 // POST /evaluate
-// Body: { question: string, answer: string }
-// Response: { scores: {...0-10}, good, missing, mistakes, improve, stronger_example }
-// ─────────────────────────────────────────────
-const EVALUATOR_SYSTEM_PROMPT = `You are an experienced technical interviewer reviewing one answer from an early-career frontend developer's practice interview. Be honest and specific, not automatically generous — this only helps him if it's accurate.
+// Body (single answer):  { mode: "answer", question, answer }
+// Body (final report):   { mode: "final", transcript: [{role, content}, ...] }
+// ─────────────────────────────────────────────────────────
+const ANSWER_EVAL_PROMPT = `You are a strict but fair technical interview coach reviewing a single answer from a practice session. Respond with ONLY a raw JSON object, no markdown fences, no commentary, matching exactly this shape:
+{
+  "scores": { "technical_accuracy": 0-10, "clarity": 0-10, "structure": 0-10, "confidence": 0-10, "relevance": 0-10, "completeness": 0-10, "communication": 0-10 },
+  "good": "1-2 sentences on what was good",
+  "missing": "1-2 sentences on what was missing, or empty string if nothing",
+  "mistakes": "1-2 sentences on technical mistakes, or empty string if none",
+  "improve": "1-2 sentences of concrete improvement advice",
+  "stronger_example": "a short example of a stronger answer to the same question"
+}
+Only include a field's content if there's something real to say; use empty string for good/missing/mistakes/improve/stronger_example when not applicable. Every score field is required.`;
 
-Score these 0-10 as integers: technical_accuracy, clarity, structure, confidence, relevance, completeness, communication.
+const FINAL_EVAL_PROMPT = `You are a strict but fair technical interview coach producing a final report for a completed practice interview. You'll receive the full transcript. Respond with ONLY a raw JSON object, no markdown fences, no commentary, matching exactly this shape:
+{
+  "overall_score": 0-100,
+  "categories": {
+    "technical_knowledge": 0-10, "javascript": 0-10, "html_css": 0-10, "react": 0-10,
+    "apis_backend": 0-10, "problem_solving": 0-10, "system_thinking": 0-10,
+    "communication": 0-10, "ui_ux": 0-10, "project_knowledge": 0-10, "confidence_clarity": 0-10
+  },
+  "strong_areas": ["short phrase", "..."],
+  "weak_areas": ["short phrase", "..."],
+  "questions_missed": ["short description", "..."],
+  "technical_corrections": ["short correction", "..."],
+  "recommended_topics": ["topic", "..."],
+  "suggested_practice_plan": "2-4 sentence plan"
+}
+Only score a category if the transcript actually touched on it; otherwise give it a neutral 5 rather than guessing wildly. Arrays can be empty if genuinely not applicable, but try to give useful, specific content — no filler.`;
 
-Then give: what was good (1-2 sentences), what was missing (1-2 sentences), technical_mistakes (empty string if none), how to improve (1-2 sentences), and a stronger_example answer written the way a calm, honest junior developer would actually say it out loud — not corporate, not overly polished, still realistic for his level.
-
-Respond with ONLY a single JSON object, no markdown fences, no preamble, in exactly this shape:
-{"scores":{"technical_accuracy":0,"clarity":0,"structure":0,"confidence":0,"relevance":0,"completeness":0,"communication":0},"good":"","missing":"","mistakes":"","improve":"","stronger_example":""}`;
+function parseJsonLoose(text) {
+  if (!text) return null;
+  const cleaned = text.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+    if (start !== -1 && end !== -1 && end > start) {
+      try {
+        return JSON.parse(cleaned.slice(start, end + 1));
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
 
 app.post("/evaluate", async (req, res) => {
   try {
-    const { question, answer } = req.body || {};
-    if (!answer || typeof answer !== "string") {
-      return res.status(400).json({ error: "answer (string) is required" });
+    const { mode, question, answer, transcript } = req.body || {};
+
+    let systemPrompt, userContent;
+
+    if (mode === "final") {
+      if (!Array.isArray(transcript) || transcript.length === 0) {
+        return res.status(400).json({ error: "transcript (non-empty array) is required for a final report" });
+      }
+      systemPrompt = FINAL_EVAL_PROMPT;
+      userContent = transcript.map((m) => `${m.role === "assistant" ? "Interviewer" : "Candidate"}: ${m.content}`).join("\n\n");
+    } else {
+      if (!question || !answer) {
+        return res.status(400).json({ error: "question and answer are required" });
+      }
+      systemPrompt = ANSWER_EVAL_PROMPT;
+      userContent = `Question: ${question}\n\nAnswer: ${answer}`;
     }
 
-    const userContent = `INTERVIEW QUESTION:\n${question || "(not provided)"}\n\nCANDIDATE'S ANSWER:\n${answer}`;
-
     const result = await getAIResponse([
-      { role: "system", content: EVALUATOR_SYSTEM_PROMPT },
+      { role: "system", content: systemPrompt },
       { role: "user", content: userContent },
     ]);
 
     if (!result) {
-      return res.json({
-        error: "AI is temporarily unavailable. Please try reviewing this answer again in a moment.",
-      });
+      return res.status(503).json({ error: "AI is temporarily unavailable. Please try again." });
     }
 
-    let parsed;
-    try {
-      const cleaned = result.content.replace(/```json|```/g, "").trim();
-      parsed = JSON.parse(cleaned);
-    } catch (parseErr) {
-      console.log("Evaluate: failed to parse JSON, returning raw content");
-      return res.json({
-        error: "Couldn't parse the evaluation. Please try again.",
-        raw: result.content,
-      });
+    const parsed = parseJsonLoose(result.content);
+    if (!parsed) {
+      return res.status(502).json({ error: "Couldn't generate a report right now. Please try again." });
     }
 
     return res.json(parsed);
