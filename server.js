@@ -186,7 +186,7 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
 // Body (single answer):  { mode: "answer", question, answer }
 // Body (final report):   { mode: "final", transcript: [{role, content}, ...] }
 // ─────────────────────────────────────────────────────────
-const ANSWER_EVAL_PROMPT = `You are a strict but fair technical interview coach reviewing a single answer from a practice session. Respond with ONLY a raw JSON object, no markdown fences, no commentary, matching exactly this shape:
+const ANSWER_EVAL_PROMPT = `You are a strict but fair technical interview coach reviewing a single answer from a practice session. Always respond in English, regardless of what language the question or answer is in. Respond with ONLY a raw JSON object, no markdown fences, no commentary, matching exactly this shape:
 {
   "scores": { "technical_accuracy": 0-10, "clarity": 0-10, "structure": 0-10, "confidence": 0-10, "relevance": 0-10, "completeness": 0-10, "communication": 0-10 },
   "good": "1-2 sentences on what was good",
@@ -197,7 +197,7 @@ const ANSWER_EVAL_PROMPT = `You are a strict but fair technical interview coach 
 }
 Only include a field's content if there's something real to say; use empty string for good/missing/mistakes/improve/stronger_example when not applicable. Every score field is required.`;
 
-const FINAL_EVAL_PROMPT = `You are a strict but fair technical interview coach producing a final report for a completed practice interview. You'll receive the full transcript. Respond with ONLY a raw JSON object, no markdown fences, no commentary, matching exactly this shape:
+const FINAL_EVAL_PROMPT = `You are a strict but fair technical interview coach producing a final report for a completed practice interview. Always respond in English, regardless of what language the transcript is in. You'll receive the full transcript. Respond with ONLY a raw JSON object, no markdown fences, no commentary, matching exactly this shape:
 {
   "overall_score": 0-100,
   "categories": {
